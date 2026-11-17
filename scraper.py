@@ -91,16 +91,64 @@ def captcha_visible(page):
             continue
     return False
 
-def wait_if_captcha(session, context_label=""):
-    """Jeda skrip dan minta penyelesaian manual jika terdeteksi captcha/verifikasi."""
+# Mode ditinggal (mis. semalaman): saat captcha muncul skrip tidak menunggu Enter,
+# melainkan istirahat lalu mengecek ulang. Captcha tidak diselesaikan otomatis;
+# biasanya pembatasan Threads hilang sendiri setelah jeda, atau bisa diselesaikan manual kapan saja.
+UNATTENDED = True
+CAPTCHA_COOLDOWN_MINUTES = 30
+MAX_CAPTCHA_RETRIES = 8  # 8 x 30 menit = 4 jam, setelah itu skrip berhenti dan data tetap tersimpan
+
+class CaptchaBlocked(Exception):
+    pass
+
+def log(message):
+    print(f"[{time.strftime('%H:%M:%S')}] {message}")
+
+def wait_if_captcha(session, context_label="", return_url=None):
+    """Tangani captcha/verifikasi: manual (tekan Enter) atau, pada mode ditinggal, jeda lalu cek ulang."""
     if not captcha_visible(session.page):
         return False
-    print(f"\n🛑 CAPTCHA/verifikasi terdeteksi{(' saat ' + context_label) if context_label else ''}.")
-    session.pause_for_user(
-        "Koneksi skrip dilepas sementara. Jika captcha belum muncul, tekan F5 di browser.\n"
-        "Selesaikan captcha secara manual, lalu tekan Enter di sini untuk melanjutkan..."
-    )
-    return True
+    log(f"🛑 CAPTCHA/verifikasi terdeteksi{(' saat ' + context_label) if context_label else ''}.")
+
+    if not UNATTENDED:
+        session.pause_for_user(
+            "Koneksi skrip dilepas sementara. Jika captcha belum muncul, tekan F5 di browser.\n"
+            "Selesaikan captcha secara manual, lalu tekan Enter di sini untuk melanjutkan..."
+        )
+        return True
+
+    for attempt in range(1, MAX_CAPTCHA_RETRIES + 1):
+        # Koneksi dilepas agar captcha bisa diselesaikan manual di Chrome bila sempat
+        session.disconnect()
+        log(f"   Istirahat {CAPTCHA_COOLDOWN_MINUTES} menit (percobaan {attempt}/{MAX_CAPTCHA_RETRIES}). "
+            "Captcha boleh diselesaikan manual di Chrome selama jeda ini.")
+        time.sleep(CAPTCHA_COOLDOWN_MINUTES * 60)
+        session.connect()
+        try:
+            session.page.reload(wait_until="domcontentloaded")
+            session.page.wait_for_timeout(8000)
+        except PlaywrightError:
+            pass
+        if not captcha_visible(session.page):
+            log("✅ Captcha sudah tidak muncul, scraping dilanjutkan.")
+            if return_url:
+                # Captcha bisa mengalihkan halaman, jadi kembali ke halaman pencarian semula
+                try:
+                    session.page.goto(return_url, wait_until="domcontentloaded")
+                    session.page.wait_for_timeout(6000)
+                except PlaywrightError:
+                    pass
+            return True
+    raise CaptchaBlocked(f"Captcha masih muncul setelah {MAX_CAPTCHA_RETRIES} kali jeda.")
+
+def prevent_system_sleep(enable):
+    """Cegah Windows masuk mode sleep selama scraping (layar tetap boleh mati)."""
+    if os.name != 'nt':
+        return
+    import ctypes
+    ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+    flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED if enable else ES_CONTINUOUS
+    ctypes.windll.kernel32.SetThreadExecutionState(flags)
 
 # Ambil isi postingan saja: hanya kartu yang punya link /post/ (kartu saran profil dilewati),
 # lalu pilih span terpanjang yang bukan nama akun (<a>) maupun tanggal (<time>)
@@ -127,6 +175,11 @@ def clean_post_text(text):
     text = UI_NOISE_PATTERN.sub(' ', text)
     return re.sub(r'\s+', ' ', text).strip()
 
+def duplicate_key(text):
+    """Kunci pembanding duplikat: huruf kecil tanpa emoji/angka/tanda baca, sehingga postingan yang
+    sama tetapi beda emoji atau spasi (mis. dari run sebelumnya) tetap dianggap duplikat."""
+    return re.sub(r'[^a-z]+', ' ', text.lower()).strip()
+
 def is_logged_in(context):
     """Cek cookie sesi Threads/Instagram untuk memastikan benar-benar sudah login."""
     return any(c['name'] == 'sessionid' and c['value'] for c in context.cookies())
@@ -139,6 +192,12 @@ SEARCH_TABS = {
 MAX_SCROLL_PER_SEARCH = 300
 MAX_STAGNANT_SCROLL = 6
 
+# Tempo dibuat lebih pelan agar Threads tidak menganggap aktivitas mencurigakan (captcha lebih jarang muncul)
+SCROLL_DELAY_MS = (4000, 8000)          # jeda antar scroll
+SEARCH_DELAY_SECONDS = (30, 90)         # jeda antar pencarian (keyword/tab)
+LONG_BREAK_EVERY_SEARCHES = 5           # setiap 5 pencarian ...
+LONG_BREAK_SECONDS = (300, 600)         # ... istirahat 5-10 menit
+
 def load_existing_rows(output_file):
     """Baca data hasil run sebelumnya agar scraping bisa dilanjutkan tanpa duplikat."""
     if not os.path.exists(output_file):
@@ -150,7 +209,8 @@ def scrape_multiple_keywords(keywords, target_total, output_file, profile_dir="f
     base_url = "https://www.threads.com/"
 
     existing_rows = load_existing_rows(output_file)
-    extracted_texts = {row['content'] for row in existing_rows} # Set global agar tidak ada data duplikat antar keyword
+    # Set global agar tidak ada data duplikat antar keyword maupun dengan data run sebelumnya
+    extracted_texts = {duplicate_key(row['content']) for row in existing_rows}
     extracted_urls = set()
     total_collected = len(existing_rows)
     if total_collected:
@@ -176,12 +236,27 @@ def scrape_multiple_keywords(keywords, target_total, output_file, profile_dir="f
             session.pause_for_user("❌ Belum terdeteksi login. Selesaikan login dulu, lalu tekan Enter lagi...")
         print("✅ Login berhasil. Sesi tersimpan di profil browser untuk run berikutnya.")
         page = session.page
+        if UNATTENDED:
+            print("🌙 Mode ditinggal aktif: captcha ditangani dengan jeda otomatis, laptop dicegah masuk sleep.")
+        prevent_system_sleep(True)
+        search_count = 0
 
         try:
             for keyword in keywords:
                 for tab_name, tab_param in SEARCH_TABS.items():
                     if total_collected >= target_total:
                         break
+
+                    # Jeda antar pencarian, dan istirahat panjang setiap beberapa pencarian
+                    if search_count:
+                        if search_count % LONG_BREAK_EVERY_SEARCHES == 0:
+                            pause = random.randint(*LONG_BREAK_SECONDS)
+                            log(f"☕ Istirahat panjang {pause // 60} menit agar tidak terdeteksi bot...")
+                        else:
+                            pause = random.randint(*SEARCH_DELAY_SECONDS)
+                            log(f"⏸️ Jeda {pause} detik sebelum pencarian berikutnya...")
+                        time.sleep(pause)
+                    search_count += 1
 
                     print(f"\n==================================================")
                     print(f"🔎 Keyword: '{keyword}' | Tab: {tab_name}")
@@ -196,7 +271,7 @@ def scrape_multiple_keywords(keywords, target_total, output_file, profile_dir="f
                     except PlaywrightError as e:
                         print(f"⚠️ Gagal membuka halaman pencarian: {e}")
                     page.wait_for_timeout(6000)
-                    if wait_if_captcha(session, f"pencarian keyword '{keyword}'"):
+                    if wait_if_captcha(session, f"pencarian keyword '{keyword}'", search_url):
                         page = session.page
 
                     # Validasi apakah berada di halaman pencarian
@@ -217,10 +292,11 @@ def scrape_multiple_keywords(keywords, target_total, output_file, profile_dir="f
 
                             for post in page.evaluate(EXTRACT_POSTS_JS):
                                 text = clean_post_text(post['text'])
-                                # Filter postingan dengan panjang wajar & cek duplikasi global (berdasarkan URL postingan)
-                                if len(text) > 20 and post['url'] not in extracted_urls and text not in extracted_texts:
+                                key = duplicate_key(text)
+                                # Filter postingan dengan panjang wajar & cek duplikasi global (URL dan isi postingan)
+                                if len(text) > 20 and post['url'] not in extracted_urls and key not in extracted_texts:
                                     extracted_urls.add(post['url'])
-                                    extracted_texts.add(text)
+                                    extracted_texts.add(key)
                                     writer.writerow({'keyword': keyword, 'content': text})
                                     search_collected += 1
                                     total_collected += 1
@@ -241,11 +317,11 @@ def scrape_multiple_keywords(keywords, target_total, output_file, profile_dir="f
 
                         try:
                             page.mouse.wheel(0, random.randint(2000, 3500)) # Scroll ke bawah (jarak diacak)
-                            page.wait_for_timeout(random.randint(2500, 5000)) # Tunggu loading (durasi diacak)
+                            page.wait_for_timeout(random.randint(*SCROLL_DELAY_MS)) # Tunggu loading (durasi diacak)
                         except PlaywrightError:
                             pass
 
-                        if wait_if_captcha(session, f"scroll keyword '{keyword}'"):
+                        if wait_if_captcha(session, f"scroll keyword '{keyword}'", search_url):
                             page = session.page
                             continue
 
@@ -253,7 +329,10 @@ def scrape_multiple_keywords(keywords, target_total, output_file, profile_dir="f
                         print(f"   -> '{keyword}' ({tab_name}): {search_collected} data | Total Keseluruhan: {total_collected}/{target_total}")
         except KeyboardInterrupt:
             print("\n⏹️ Dihentikan oleh pengguna. Data yang sudah terkumpul tetap tersimpan.")
+        except CaptchaBlocked as e:
+            log(f"⛔ {e} Skrip dihentikan, data yang sudah terkumpul tetap tersimpan. Jalankan ulang untuk melanjutkan.")
         finally:
+            prevent_system_sleep(False)
             output.close()
             session.close()
 
@@ -262,7 +341,7 @@ def scrape_multiple_keywords(keywords, target_total, output_file, profile_dir="f
 
 if __name__ == "__main__":
     # Daftar kata kunci yang diinginkan.
-    # Satu pencarian Threads hanya memberi ratusan postingan, jadi untuk 20.000 data perlu banyak keyword.
+    # Satu pencarian Threads hanya memberi ratusan postingan, jadi untuk 40.000 data perlu banyak keyword.
     daftar_keyword = [
         "ASI eksklusif stunting",
         "imunisasi bayi stunting",
@@ -298,6 +377,6 @@ if __name__ == "__main__":
 
     scrape_multiple_keywords(
         keywords=daftar_keyword,
-        target_total=20000,
+        target_total=40000,
         output_file="file/raw_text.csv"
     )
